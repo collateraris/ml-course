@@ -17,6 +17,8 @@ def entropy(y):
         Entropy of the provided subset
     """
     EPS = 0.0005
+    if y.shape[0] == 0:
+        return 0
     # YOUR CODE HERE
     y_all = np.zeros(y.shape[-1])
     for i in range(y.shape[0]):
@@ -46,6 +48,8 @@ def gini(y):
     """
 
     # YOUR CODE HERE
+    if y.shape[0] == 0:
+        return 1
     y_all = np.zeros(y.shape[-1])
     for i in range(y.shape[0]):
         for j in range(len(y_all)):
@@ -74,6 +78,8 @@ def variance(y):
     
     # YOUR CODE HERE
     R = y.shape[0]
+    if R == 0:
+        return 0
     sum = 0
     y_mean = np.mean(y)
     for i in range(R):
@@ -99,6 +105,8 @@ def mad_median(y):
 
     # YOUR CODE HERE
     R = y.shape[0]
+    if R == 0:
+        return 0
     sum = 0
     y_median = np.median(y)
     for i in range(R):
@@ -192,7 +200,7 @@ class DecisionTree(BaseEstimator):
         
         return (X_left, y_left), (X_right, y_right)
 
-    def make_tree(self, X_subset, y_subset):
+    def make_tree(self, X_subset, y_subset, current_depth):
         """
         Recursively builds the tree
 
@@ -212,8 +220,33 @@ class DecisionTree(BaseEstimator):
         """
 
         # YOUR CODE HERE
-        return []
-        #return new_node
+
+        n_samples = X_subset.shape[0]
+        #print(current_depth, n_samples)
+        if n_samples >= self.min_samples_split and current_depth  < self.max_depth:
+            feature_index, threshold = self.choose_best_split(X_subset, y_subset)
+            (X_left, y_left), (X_right, y_right) = self.make_split(feature_index, threshold, X_subset, y_subset)
+
+            leaf = Node(feature_index=feature_index, threshold=threshold)
+            leaf.left_child = self.make_tree(X_left, y_left, current_depth=current_depth + 1)
+            leaf.right_child = self.make_tree(X_right, y_right, current_depth=current_depth + 1)
+            return leaf
+
+        #threshold as value
+        best_value = self.eval_best_y(y_subset)
+        print(best_value)
+        last_node = Node(feature_index=-1, threshold=best_value)
+        last_node.left_child = None
+        last_node.right_child = None
+        return last_node
+
+    def eval_best_y(self, y_subset):
+        if y_subset.shape[1] > 1:
+            y = one_hot_decode(y_subset)
+        else:
+            y = y_subset
+        return y[np.argmax(y)][0]
+
 
     def fit(self, X, y):
         """
@@ -236,11 +269,51 @@ class DecisionTree(BaseEstimator):
                 self.n_classes = len(np.unique(y))
             y = one_hot_encode(self.n_classes, y)
 
-        #self.root =  self.make_tree(X, y)
-        self.root = entropy(y)
+        self.root =  self.make_tree(X, y, current_depth = 0)
 
-    def eval_G(self, y_all, y_left, y_right):
+    def choose_best_split(self, X_subset, y_subset):
+        """
+        Greedily select the best feature and best threshold w.r.t. selected criterion
 
+        Parameters
+        ----------
+        X_subset : np.array of type float with shape (n_objects, n_features)
+            Feature matrix representing the selected subset
+
+        y_subset : np.array of type float with shape (n_objects, n_classes) in classification
+                   (n_objects, 1) in regression
+            One-hot representation of class labels or target values for corresponding subset
+
+        Returns
+        -------
+        feature_index : int
+            Index of feature to make split with
+
+        threshold : float
+            Threshold value to perform split
+
+        """
+        feature_index_best = -1
+        threshold_best = -1
+        eval_G_best = -1
+        # YOUR CODE HERE
+        num_features = X_subset.shape[1]
+        for feature_index in range(num_features):
+            feature_value = X_subset[:, feature_index]
+            thresholds = np.unique(feature_value)
+            for threshold in thresholds:
+                y_left, y_right = self.make_slit_only_y(feature_index, threshold, X_subset, y_subset)
+                if y_left.shape[0] == 0 or y_right.shape[0] == 0:
+                    continue
+                eval_G = self.eval_G_best(y_subset, y_left, y_right)
+                if eval_G_best < eval_G:
+                    eval_G_best = eval_G
+                    feature_index_best = feature_index
+                    threshold_best = threshold
+
+        return feature_index_best, threshold_best
+
+    def eval_G_best(self, y_all, y_left, y_right):
         Q = float(y_all.shape[0])
         L_Q = float(y_left.shape[0]) / Q
         R_Q = float(y_right.shape[0]) / Q
@@ -250,47 +323,14 @@ class DecisionTree(BaseEstimator):
         elif self.criterion_name == 'entropy':
             return entropy(y_all) - L_Q * entropy(y_left) - R_Q * entropy(y_right)
         elif self.criterion_name == 'variance':
-            y_all_decode = one_hot_decode(y_all)
-            y_left_decode = one_hot_decode(y_left)
-            y_right_decode = one_hot_decode(y_right)
-            return variance(y_all_decode) - L_Q * variance(y_left_decode) - R_Q * variance(y_right_decode)
+            return variance(y_all) - L_Q * variance(y_left) - R_Q * variance(y_right)
         elif self.criterion_name == 'mad_median':
-            y_all_decode = one_hot_decode(y_all)
-            y_left_decode = one_hot_decode(y_left)
-            y_right_decode = one_hot_decode(y_right)
-            return mad_median(y_all_decode) - L_Q * mad_median(y_left_decode) - R_Q * mad_median(y_right_decode)
+            return mad_median(y_all) - L_Q * mad_median(y_left) - R_Q * mad_median(y_right)
 
-        def choose_best_split(self, X_subset, y_subset):
-            """
-            Greedily select the best feature and best threshold w.r.t. selected criterion
-
-            Parameters
-            ----------
-            X_subset : np.array of type float with shape (n_objects, n_features)
-                Feature matrix representing the selected subset
-
-            y_subset : np.array of type float with shape (n_objects, n_classes) in classification
-                       (n_objects, 1) in regression
-                One-hot representation of class labels or target values for corresponding subset
-
-            Returns
-            -------
-            feature_index : int
-                Index of feature to make split with
-
-            threshold : float
-                Threshold value to perform split
-
-            """
-            # YOUR CODE HERE
-            feature_index = 1
-            threshold = 1
-            return feature_index, threshold
-
-    def make_split_only_y(self, feature_index, threshold, X_subset, y_subset):
+    def make_slit_only_y(self, feature_index, threshold, X_subset, y_subset):
         """
         Split only target values into two subsets with specified feature and threshold
-        
+
         Parameters
         ----------
         feature_index : int
@@ -302,18 +342,18 @@ class DecisionTree(BaseEstimator):
         X_subset : np.array of type float with shape (n_objects, n_features)
             Feature matrix representing the selected subset
 
-        y_subset : np.array of type float with shape (n_objects, n_classes) in classification 
-                   (n_objects, 1) in regression 
+        y_subset : np.array of type float with shape (n_objects, n_classes) in classification
+                   (n_objects, 1) in regression
             One-hot representation of class labels for corresponding subset
-        
+
         Returns
         -------
-        y_left : np.array of type float with shape (n_objects_left, n_classes) in classification 
-                   (n_objects, 1) in regression 
+        y_left : np.array of type float with shape (n_objects_left, n_classes) in classification
+                   (n_objects, 1) in regression
             Part of the provided subset where selected feature x^j < threshold
 
-        y_right : np.array of type float with shape (n_objects_right, n_classes) in classification 
-                   (n_objects, 1) in regression 
+        y_right : np.array of type float with shape (n_objects_right, n_classes) in classification
+                   (n_objects, 1) in regression
             Part of the provided subset where selected feature x^j >= threshold
         """
 
@@ -324,9 +364,10 @@ class DecisionTree(BaseEstimator):
         y_left = y_subset[left_mask]
         y_right = y_subset[right_mask]
         return y_left, y_right
-"""
+
+
     def predict(self, X):
-        "" "
+        """
         Predict the target value or class label  the model from scratch using the provided data
         
         Parameters
@@ -340,12 +381,13 @@ class DecisionTree(BaseEstimator):
                    (n_objects, 1) in regression 
             Column vector of class labels in classification or target values in regression
         
-        "" "
+        """
 
         # YOUR CODE HERE
-        
+        y_predicted = 0
         return y_predicted
-        
+
+    """
     def predict_proba(self, X):
         "" "
         Only for classification
@@ -369,6 +411,7 @@ class DecisionTree(BaseEstimator):
         return y_predicted_probs
 """
 
+
 import numpy as np
 from matplotlib import pyplot as plt
 from sklearn.base import BaseEstimator
@@ -381,17 +424,20 @@ RANDOM_STATE = 42
 X = np.ones((4, 5), dtype=float) * np.arange(4)[:, None]
 y = np.arange(4)[:, None] + np.asarray([0.2, -0.3, 0.1, 0.4])[:, None]
 class_estimator = DecisionTree(max_depth=10, criterion_name='gini')
-
+"""
 (X_l, y_l), (X_r, y_r) = class_estimator.make_split(1, 1., X, y)
 
 print(np.array_equal(X[:1], X_l))
 print(np.array_equal(X[1:], X_r))
 print(np.array_equal(y[:1], y_l))
 print(np.array_equal(y[1:], y_r))
-
+"""
 digits_data = load_digits().data
 digits_target = load_digits().target[:, None] # to make the targets consistent with our model interfaces
 X_train, X_test, y_train, y_test = train_test_split(digits_data, digits_target, test_size=0.2, random_state=RANDOM_STATE)
 
 class_estimator = DecisionTree(max_depth=10, criterion_name='gini')
 class_estimator.fit(X_train, y_train)
+ans = class_estimator.predict(X_test)
+#accuracy_gini = accuracy_score(y_test, ans)
+#print(accuracy_gini)
