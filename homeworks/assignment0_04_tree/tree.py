@@ -1,6 +1,6 @@
 import numpy as np
 from sklearn.base import BaseEstimator
-
+#import time
 
 def entropy(y):  
     """
@@ -17,20 +17,9 @@ def entropy(y):
         Entropy of the provided subset
     """
     EPS = 0.0005
-    if y.shape[0] == 0:
-        return 0
-    # YOUR CODE HERE
-    y_all = np.zeros(y.shape[-1])
-    for i in range(y.shape[0]):
-        for j in range(len(y_all)):
-            y_all[j] += y[i, j]
-
-    y_all /= float(y.shape[0])
-    sum = 0
-    for i in range(y_all.shape[0]):
-        sum += y_all[i] * np.log(y_all[i] + EPS)
-    
-    return  -sum
+    p = np.mean(y, axis=0)
+    e = - np.sum(p * np.log(p + EPS))
+    return  e
     
 def gini(y):
     """
@@ -48,18 +37,10 @@ def gini(y):
     """
 
     # YOUR CODE HERE
-    if y.shape[0] == 0:
-        return 1
-    y_all = np.zeros(y.shape[-1])
-    for i in range(y.shape[0]):
-        for j in range(len(y_all)):
-            y_all[j] += y[i, j]
 
-    y_all /= float(y.shape[0])
-    y_all *= y_all
-    # YOUR CODE HERE
-
-    return 1 - np.sum(y_all)
+    p = np.mean(y, axis=0)
+    g = 1.0 - np.sum(p ** 2)
+    return g
     
 def variance(y):
     """
@@ -78,14 +59,10 @@ def variance(y):
     
     # YOUR CODE HERE
     R = y.shape[0]
-    if R == 0:
-        return 0
-    sum = 0
     y_mean = np.mean(y)
-    for i in range(R):
-        sum += (y[i] - y_mean) ** 2
+    g = np.sum((y - y_mean) ** 2)
     
-    return sum / R
+    return g / R
 
 def mad_median(y):
     """
@@ -105,14 +82,9 @@ def mad_median(y):
 
     # YOUR CODE HERE
     R = y.shape[0]
-    if R == 0:
-        return 0
-    sum = 0
     y_median = np.median(y)
-    for i in range(R):
-        sum += np.abs(y[i] - y_median)
-
-    return sum / R
+    g = np.sum((y - y_median) ** 2)
+    return g / R
 
 
 def one_hot_encode(n_classes, y):
@@ -223,10 +195,9 @@ class DecisionTree(BaseEstimator):
 
         n_samples = X_subset.shape[0]
         #print(current_depth, n_samples)
-        if n_samples >= self.min_samples_split and current_depth  < self.max_depth:
+        if n_samples >= self.min_samples_split and current_depth  <= self.max_depth:
             feature_index, threshold = self.choose_best_split(X_subset, y_subset)
             (X_left, y_left), (X_right, y_right) = self.make_split(feature_index, threshold, X_subset, y_subset)
-
             leaf = Node(feature_index=feature_index, threshold=threshold)
             leaf.left_child = self.make_tree(X_left, y_left, current_depth=current_depth + 1)
             leaf.right_child = self.make_tree(X_right, y_right, current_depth=current_depth + 1)
@@ -234,7 +205,7 @@ class DecisionTree(BaseEstimator):
 
         #threshold as value
         best_value = self.eval_best_y(y_subset)
-        print(best_value)
+        #print(best_value)
         last_node = Node(feature_index=-1, threshold=best_value)
         last_node.left_child = None
         last_node.right_child = None
@@ -293,6 +264,7 @@ class DecisionTree(BaseEstimator):
             Threshold value to perform split
 
         """
+
         feature_index_best = -1
         threshold_best = -1
         eval_G_best = -1
@@ -384,8 +356,25 @@ class DecisionTree(BaseEstimator):
         """
 
         # YOUR CODE HERE
-        y_predicted = 0
-        return y_predicted
+        y_predicted = []
+        # For each instance in X, make a prediction by traversing the tree
+        for x in X:
+            prediction = self.make_prediction(x, self.root)
+            # Append the prediction to the list of predictions
+            y_predicted.append(prediction)
+        # Convert the list to a numpy array and return it
+        return np.array(y_predicted)
+
+    def make_prediction(self, x, node):
+
+        if node.feature_index == -1:
+            return node.value
+        else:
+            feature = x[node.feature_index]
+            if feature < node.value:
+                return self.make_prediction(x, node.left_child)
+            else:
+                return self.make_prediction(x, node.right_child)
 
     """
     def predict_proba(self, X):
@@ -424,14 +413,14 @@ RANDOM_STATE = 42
 X = np.ones((4, 5), dtype=float) * np.arange(4)[:, None]
 y = np.arange(4)[:, None] + np.asarray([0.2, -0.3, 0.1, 0.4])[:, None]
 class_estimator = DecisionTree(max_depth=10, criterion_name='gini')
-"""
+
 (X_l, y_l), (X_r, y_r) = class_estimator.make_split(1, 1., X, y)
 
 print(np.array_equal(X[:1], X_l))
 print(np.array_equal(X[1:], X_r))
 print(np.array_equal(y[:1], y_l))
 print(np.array_equal(y[1:], y_r))
-"""
+
 digits_data = load_digits().data
 digits_target = load_digits().target[:, None] # to make the targets consistent with our model interfaces
 X_train, X_test, y_train, y_test = train_test_split(digits_data, digits_target, test_size=0.2, random_state=RANDOM_STATE)
@@ -439,5 +428,10 @@ X_train, X_test, y_train, y_test = train_test_split(digits_data, digits_target, 
 class_estimator = DecisionTree(max_depth=10, criterion_name='gini')
 class_estimator.fit(X_train, y_train)
 ans = class_estimator.predict(X_test)
-#accuracy_gini = accuracy_score(y_test, ans)
-#print(accuracy_gini)
+accuracy_gini = accuracy_score(y_test, ans)
+print(accuracy_gini)
+class_estimator = DecisionTree(max_depth=10, criterion_name='entropy')
+class_estimator.fit(X_train, y_train)
+ans = class_estimator.predict(X_test)
+accuracy_entropy = accuracy_score(y_test, ans)
+print(accuracy_entropy)
