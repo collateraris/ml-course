@@ -193,8 +193,8 @@ def launch_flow_matching():
     
     # Настройки для условной генерации
     args.run_name = "FlowMatching_Conditional"
-    args.epochs = 500
-    args.batch_size = 12
+    args.epochs = 100
+    args.batch_size = 10
     args.image_size = 64
     args.dataset_path = r"E:\data_diffuse\datasets\cifar10-64\train"
     args.conditional = True
