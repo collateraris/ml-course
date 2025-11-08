@@ -12,176 +12,98 @@ from torch import optim
 from utils import *
 import logging
 from torch.utils.tensorboard import SummaryWriter
+from diffusers import AutoencoderKL
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s: %(message)s", level=logging.INFO, datefmt="%I:%M:%S")
 
 
-class ImprovedVAE(nn.Module):
-    """Улучшенный VAE для Flow Matching в латентном пространстве 32x32"""
-    def __init__(self, in_channels=3, latent_channels=16, base_channels=64):
+class StableDiffusionVAE(nn.Module):
+    """Обертка для Stable Diffusion VAE"""
+    def __init__(self, model_id="stabilityai/sd-vae-ft-mse", device="cuda"):
         super().__init__()
+        self.device = device
         
-        # Encoder с residual connections
-        self.encoder = nn.ModuleList([
-            # 64x64 -> 32x32
-            nn.Sequential(
-                nn.Conv2d(in_channels, base_channels, 4, 2, 1),
-                nn.BatchNorm2d(base_channels),
-                nn.LeakyReLU(0.2),
-            ),
-            
-            # 32x32 -> 32x32 (residual block, same channels)
-            self._make_residual_block(base_channels, base_channels),
-            
-            # 32x32 -> 32x32 (residual block, same channels)
-            self._make_residual_block(base_channels, base_channels),
-            
-            # 32x32 -> 32x32 (residual block, same channels)
-            self._make_residual_block(base_channels, base_channels),
-        ])
+        # Загружаем предобученный Stable Diffusion VAE
+        # Выбираем dtype в зависимости от устройства: на CPU используем float32
+        load_dtype = torch.float16 if (str(device).startswith("cuda") and torch.cuda.is_available()) else torch.float32
+        self.vae = AutoencoderKL.from_pretrained(model_id, torch_dtype=load_dtype)
+        self.vae.to(device=device, dtype=load_dtype)
+        self.vae.eval()
         
-        # Финальный слой для изменения количества каналов
-        self.encoder_final = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels * 2, 3, 1, 1),
-            nn.BatchNorm2d(base_channels * 2),
-            nn.LeakyReLU(0.2),
-        )
-        
-        # VAE heads с attention
-        self.attention = nn.Sequential(
-            nn.Conv2d(base_channels * 2, base_channels * 2, 3, 1, 1),
-            nn.BatchNorm2d(base_channels * 2),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(base_channels * 2, base_channels * 2, 3, 1, 1),
-            nn.Sigmoid()
-        )
-        
-        self.mu_head = nn.Sequential(
-            nn.Conv2d(base_channels * 2, latent_channels, 3, 1, 1),
-            nn.BatchNorm2d(latent_channels),
-        )
-        
-        self.logvar_head = nn.Sequential(
-            nn.Conv2d(base_channels * 2, latent_channels, 3, 1, 1),
-            nn.BatchNorm2d(latent_channels),
-        )
-        
-        # Decoder с residual connections
-        self.decoder = nn.ModuleList([
-            # 32x32 -> 32x32 (residual block, same channels)
-            self._make_residual_block(latent_channels, latent_channels),
-            
-            # 32x32 -> 32x32 (residual block, same channels)
-            self._make_residual_block(latent_channels, latent_channels),
-            
-            # 32x32 -> 32x32 (residual block, same channels)
-            self._make_residual_block(latent_channels, latent_channels),
-        ])
-        
-        # Финальный слой для upsampling
-        self.decoder_final = nn.Sequential(
-            nn.ConvTranspose2d(latent_channels, in_channels, 4, 2, 1),
-            nn.Tanh()
-        )
-        
-    def _make_residual_block(self, in_channels, out_channels):
-        """Создает residual block"""
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, 1, 1),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
-            nn.BatchNorm2d(out_channels),
-        )
-    
-    def _apply_residual_block(self, x, block):
-        """Применяет residual block"""
-        residual = block(x)
-        
-        # Проверяем, нужно ли адаптировать размеры для residual connection
-        if residual.shape == x.shape:
-            # Если размеры совпадают, добавляем residual connection
-            residual = residual + x
-        else:
-            # Если размеры не совпадают, используем только residual без skip connection
-            pass
-            
-        return F.leaky_relu(residual, 0.2)
+        # Параметры латентного пространства SD VAE
+        self.latent_channels = 4  # SD VAE использует 4 канала
+        self.latent_size = 8      # Для изображений 64x64 -> латент 8x8
         
     def encode(self, x):
-        """Кодирует изображение в параметры распределения (mu, logvar)"""
-        # Применяем encoder с residual connections
-        h = x
-        
-        for i, layer in enumerate(self.encoder):
-            if i == 0:
-                h = layer(h)
-            else:
-                h = self._apply_residual_block(h, layer)
-        
-        # Финальный слой для изменения количества каналов
-        h = self.encoder_final(h)
-        
-        # Применяем attention
-        attention_weights = self.attention(h)
-        h = h * attention_weights
-        
-        # Получаем mu и logvar
-        mu = self.mu_head(h)
-        logvar = self.logvar_head(h)
-        
-        return mu, logvar
+        """
+        Кодирует изображение в латентное пространство.
+        x: (B, 3, H, W) - изображения в диапазоне [-1, 1]
+        Возвращает: latent - (B, 4, H//8, W//8)
+        """
+        with torch.no_grad():
+            # SD VAE ожидает изображения в диапазоне [-1, 1]
+            if x.max() > 1.0:
+                x = (x / 255.0) * 2.0 - 1.0
+            # Приводим вход к dtype/устройству VAE
+            x = x.to(device=self.device, dtype=next(self.vae.parameters()).dtype)
+            
+            # Кодируем в латентное пространство
+            latent_dist = self.vae.encode(x)
+            latent = latent_dist.latent_dist.sample()
+            
+            # Масштабируем согласно SD конвенции
+            latent = latent * self.vae.config.scaling_factor
+            
+        return latent
+    
+    def decode(self, z):
+        """
+        Декодирует латентное представление в изображение.
+        z: (B, 4, H//8, W//8) - латентные представления
+        Возвращает: image - (B, 3, H, W) в диапазоне [-1, 1]
+        """
+        with torch.no_grad():
+            # Приводим латент к dtype/устройству VAE
+            z = z.to(device=self.device, dtype=next(self.vae.parameters()).dtype)
+            # Масштабируем обратно
+            z = z / self.vae.config.scaling_factor
+            
+            # Декодируем в изображение
+            image = self.vae.decode(z).sample
+            
+        return image
     
     def reparameterize(self, mu, logvar):
-        """Reparameterization trick для VAE"""
+        """Для совместимости с существующим кодом"""
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
     
-    def decode(self, z):
-        """Декодирует латентное представление в изображение"""
-        h = z
-        
-        # Применяем residual blocks
-        for layer in self.decoder:
-            h = self._apply_residual_block(h, layer)
-        
-        # Финальный upsampling
-        h = self.decoder_final(h)
-        
-        return h
-    
     def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        recon = self.decode(z)
-        return recon, z, mu, logvar
+        """Forward pass для совместимости"""
+        latent = self.encode(x)
+        recon = self.decode(latent)
+        
+        # Создаем фиктивные mu и logvar для совместимости
+        mu = torch.zeros_like(latent)
+        logvar = torch.zeros_like(latent)
+        
+        return recon, latent, mu, logvar
     
     def sample(self, n_samples, device):
         """Генерирует случайные образцы из латентного пространства"""
-        z = torch.randn(n_samples, self.mu_head[0].out_channels, 32, 32).to(device)
+        z = torch.randn(n_samples, self.latent_channels, self.latent_size, self.latent_size).to(device)
         return self.decode(z)
     
     def compute_loss(self, recon_x, x, mu, logvar, beta=1.0, perceptual_weight=0.1):
-        """Вычисляет улучшенный VAE loss"""
-        # Reconstruction loss (MSE)
-        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
-        
-        # Perceptual loss (L1 для лучшего качества)
-        perceptual_loss = F.l1_loss(recon_x, x, reduction='sum')
-        
-        # KL divergence loss
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        
-        # Total loss
-        total_loss = recon_loss + perceptual_weight * perceptual_loss + beta * kl_loss
-        
-        return total_loss, recon_loss, kl_loss
+        """Вычисляет loss для совместимости (SD VAE не обучается)"""
+        # Для предобученного SD VAE возвращаем нулевой loss
+        return torch.tensor(0.0, device=x.device), torch.tensor(0.0, device=x.device), torch.tensor(0.0, device=x.device)
 
 
 class LatentPatchEmbedding(nn.Module):
-    """Преобразует латентные представления 32x32 в патчи и эмбеддинги"""
-    def __init__(self, latent_size=32, latent_channels=8, patch_size=4, embed_dim=512):
+    """Преобразует латентные представления 8x8 в патчи и эмбеддинги для SD VAE"""
+    def __init__(self, latent_size=8, latent_channels=4, patch_size=2, embed_dim=512):
         super().__init__()
         self.latent_size = latent_size
         self.latent_channels = latent_channels
@@ -191,9 +113,9 @@ class LatentPatchEmbedding(nn.Module):
         self.proj = nn.Conv2d(latent_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         
     def forward(self, x):
-        # x: (B, latent_channels, latent_size, latent_size) -> (B, latent_channels, 32, 32)
-        x = self.proj(x)  # (B, embed_dim, latent_size//patch_size, latent_size//patch_size) -> (B, embed_dim, 8, 8)
-        # (B, embed_dim, 8, 8) -> (B, embed_dim, 64)
+        # x: (B, latent_channels, latent_size, latent_size) -> (B, 4, 8, 8)
+        x = self.proj(x)  # (B, embed_dim, latent_size//patch_size, latent_size//patch_size) -> (B, embed_dim, 4, 4)
+        # (B, embed_dim, 4, 4) -> (B, embed_dim, 16)
         x = x.flatten(2).transpose(1, 2)
         return x
 
@@ -232,8 +154,8 @@ class LatentDiTBlock(nn.Module):
 
 
 class LatentDiT(nn.Module):
-    """DiT для работы в латентном пространстве 32x32"""
-    def __init__(self, latent_size=32, latent_channels=8, patch_size=4, embed_dim=512, 
+    """DiT для работы в латентном пространстве SD VAE 8x8"""
+    def __init__(self, latent_size=8, latent_channels=4, patch_size=2, embed_dim=512, 
                  depth=12, num_heads=8, mlp_ratio=4.0, num_classes=None, dropout=0.1):
         super().__init__()
         self.latent_size = latent_size
@@ -354,14 +276,14 @@ class LatentDiT(nn.Module):
 
 
 class LatentFlowMatchingDiT:
-    def __init__(self, img_size=64, latent_size=32, latent_channels=8, device="cuda"):
+    def __init__(self, img_size=64, latent_size=8, latent_channels=4, device="cuda"):
         """
-        Flow Matching в латентном пространстве 32x32 с DiT.
+        Flow Matching в латентном пространстве SD VAE 8x8 с DiT.
         
         Args:
             img_size: размер изображений
-            latent_size: размер латентного пространства (32x32)
-            latent_channels: количество каналов в латентном пространстве
+            latent_size: размер латентного пространства SD VAE (8x8)
+            latent_channels: количество каналов в латентном пространстве SD VAE (4)
             device: устройство для вычислений
         """
         self.img_size = img_size
@@ -526,9 +448,7 @@ class LatentFlowMatchingDiT:
         autoencoder.eval()
         
         with torch.no_grad():
-            # Тестируем реконструкцию VAE
-            total_recon_loss = 0
-            total_kl_loss = 0
+            # Тестируем реконструкцию SD VAE
             num_batches = 0
             
             for images, _ in dataloader:
@@ -537,18 +457,14 @@ class LatentFlowMatchingDiT:
                     
                 images = images.to(device)
                 recon_images, z, mu, logvar = autoencoder(images)
-                
-                # Вычисляем loss VAE
-                total_loss, recon_loss, kl_loss = autoencoder.compute_loss(recon_images, images, mu, logvar)
-                total_recon_loss += recon_loss.item()
-                total_kl_loss += kl_loss.item()
                 num_batches += 1
             
-            avg_recon_loss = total_recon_loss / num_batches
-            avg_kl_loss = total_kl_loss / num_batches
+            # SD VAE не обучается, поэтому loss = 0
+            avg_recon_loss = 0.0
+            avg_kl_loss = 0.0
             
-            print(f"VAE Reconstruction Loss: {avg_recon_loss:.4f}")
-            print(f"VAE KL Loss: {avg_kl_loss:.4f}")
+            print(f"SD VAE Reconstruction Loss: {avg_recon_loss:.4f} (pre-trained)")
+            print(f"SD VAE KL Loss: {avg_kl_loss:.4f} (pre-trained)")
             
             # Тестируем Flow Matching
             z0 = torch.randn(num_samples, self.latent_channels, self.latent_size, self.latent_size).to(device)
@@ -580,18 +496,17 @@ def train_latent_flow_matching_dit(args):
     device = args.device
     dataloader = get_data(args)
     
-    # Создаем улучшенный VAE
-    autoencoder = ImprovedVAE(
-        in_channels=3,
-        latent_channels=args.latent_channels,
-        base_channels=args.base_channels
-    ).to(device)
+    # Создаем Stable Diffusion VAE
+    autoencoder = StableDiffusionVAE(
+        model_id="stabilityai/sd-vae-ft-mse",
+        device=device
+    )
     
-    # Создаем DiT модель для латентного пространства
+    # Создаем DiT модель для латентного пространства SD VAE
     model = LatentDiT(
-        latent_size=args.latent_size,
-        latent_channels=args.latent_channels,
-        patch_size=args.patch_size,
+        latent_size=8,  # SD VAE использует 8x8 латентное пространство
+        latent_channels=4,  # SD VAE использует 4 канала
+        patch_size=2,  # Уменьшенный patch size для меньшего латентного пространства
         embed_dim=args.embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
@@ -600,19 +515,17 @@ def train_latent_flow_matching_dit(args):
         dropout=args.dropout
     ).to(device)
     
-    # Оптимизаторы с улучшенными настройками
-    autoencoder_optimizer = optim.AdamW(autoencoder.parameters(), lr=args.autoencoder_lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+    # Оптимизаторы (только для DiT модели, VAE не обучается)
     model_optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     
-    # Learning rate schedulers с warmup
-    autoencoder_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(autoencoder_optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    # Learning rate scheduler только для DiT
     model_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(model_optimizer, T_0=10, T_mult=2, eta_min=1e-6)
     
-    # Создаем Flow Matching объект
+    # Создаем Flow Matching объект для SD VAE
     flow_matching = LatentFlowMatchingDiT(
         img_size=args.image_size,
-        latent_size=args.latent_size,
-        latent_channels=args.latent_channels,
+        latent_size=8,  # SD VAE использует 8x8
+        latent_channels=4,  # SD VAE использует 4 канала
         device=device
     )
     
@@ -620,62 +533,18 @@ def train_latent_flow_matching_dit(args):
     logger = SummaryWriter(os.path.join("runs", args.run_name))
     l = len(dataloader)
 
-    # Проверяем, есть ли уже обученная VAE
-    vae_checkpoint_path = os.path.join("models", args.run_name, "vae_ckpt.pt")
-    
-    if os.path.exists(vae_checkpoint_path) and not args.retrain_vae:
-        logging.info("Loading pre-trained VAE...")
-        autoencoder.load_state_dict(torch.load(vae_checkpoint_path, map_location=device))
-        logging.info("VAE loaded successfully!")
-    else:
-        # Обучаем VAE с нуля
-        logging.info("Training VAE from scratch...")
-        for epoch in range(args.autoencoder_epochs):
-            autoencoder.train()
-            pbar = tqdm(dataloader, desc=f"VAE Epoch {epoch}")
-            
-            for i, (images, _) in enumerate(pbar):
-                images = images.to(device)
-                
-                # Forward pass
-                recon_images, latent, mu, logvar = autoencoder(images)
-                
-                # VAE loss (reconstruction + perceptual + KL divergence)
-                total_loss, recon_loss, kl_loss = autoencoder.compute_loss(recon_images, images, mu, logvar, args.beta, args.perceptual_weight)
-                
-                autoencoder_optimizer.zero_grad()
-                total_loss.backward()
-                autoencoder_optimizer.step()
-                
-                pbar.set_postfix(TotalLoss=total_loss.item(), ReconLoss=recon_loss.item(), KLLoss=kl_loss.item())
-                logger.add_scalar("VAE/TotalLoss", total_loss.item(), global_step=epoch * l + i)
-                logger.add_scalar("VAE/ReconstructionLoss", recon_loss.item(), global_step=epoch * l + i)
-                logger.add_scalar("VAE/KLLoss", kl_loss.item(), global_step=epoch * l + i)
-            
-            # Обновляем learning rate для VAE
-            autoencoder_scheduler.step()
-            
-            # Сохраняем VAE каждые 10 эпох
-            if epoch % 10 == 0:
-                torch.save(autoencoder.state_dict(), vae_checkpoint_path)
-                logging.info(f"VAE saved at epoch {epoch}")
-        
-        # Сохраняем финальную версию VAE
-        torch.save(autoencoder.state_dict(), vae_checkpoint_path)
-        logging.info("VAE training completed and saved!")
+    # SD VAE уже предобучен, пропускаем обучение VAE
+    logging.info("Using pre-trained Stable Diffusion VAE - no training needed!")
     
     # Тестируем качество VAE
-    logging.info("Testing VAE quality...")
+    logging.info("Testing SD VAE quality...")
     with torch.no_grad():
         test_images, _ = next(iter(dataloader))
         test_images = test_images[:4].to(device)  # Берем 4 изображения для теста
         
-        recon_images, _, mu, logvar = autoencoder(test_images)
-        test_loss, test_recon_loss, test_kl_loss = autoencoder.compute_loss(recon_images, test_images, mu, logvar, args.beta)
-        
-        logging.info(f"VAE Test - Total Loss: {test_loss.item():.4f}, "
-                    f"Recon Loss: {test_recon_loss.item():.4f}, "
-                    f"KL Loss: {test_kl_loss.item():.4f}")
+        recon_images, latent, mu, logvar = autoencoder(test_images)
+        logging.info(f"SD VAE Test - Latent shape: {latent.shape}")
+        logging.info(f"SD VAE Test - Reconstruction shape: {recon_images.shape}")
     
     # Проверяем, есть ли уже обученная DiT модель
     dit_checkpoint_path = os.path.join("models", args.run_name, "dit_ckpt.pt")
@@ -683,11 +552,18 @@ def train_latent_flow_matching_dit(args):
     
     if os.path.exists(dit_checkpoint_path) and not args.retrain_dit:
         logging.info("Loading pre-trained DiT model...")
-        model.load_state_dict(torch.load(dit_checkpoint_path, map_location=device))
-        logging.info("DiT model loaded successfully!")
-        start_epoch = args.epochs  # Пропускаем обучение, если модель уже обучена
+        checkpoint = torch.load(dit_checkpoint_path, map_location=device)
+        try:
+            model.load_state_dict(checkpoint, strict=True)
+            logging.info("DiT model loaded successfully!")
+            start_epoch = args.epochs  # Пропускаем обучение, если модель уже обучена
+        except RuntimeError as e:
+            # Если архитектура не совпадает, начинаем обучение заново
+            logging.warning(f"Checkpoint architecture mismatch (old VAE architecture). Starting fresh training.")
+            logging.info("Training Flow Matching model from scratch...")
+            start_epoch = 0
     else:
-        logging.info("Training Flow Matching model...")
+        logging.info("Training Flow Matching model from scratch...")
     
     # Теперь обучаем Flow Matching модель
     for epoch in range(start_epoch, args.epochs):
@@ -701,10 +577,12 @@ def train_latent_flow_matching_dit(args):
             images = images.to(device)
             labels = labels.to(device)
             
-            # Кодируем изображения в латентное пространство
+            # Кодируем изображения в латентное пространство SD VAE
             with torch.no_grad():
-                mu, logvar = autoencoder.encode(images)
-                z1 = autoencoder.reparameterize(mu, logvar)
+                z1 = autoencoder.encode(images)
+            
+            # Приводим к float32 для обучения
+            z1 = z1.float()
             
             # Создаем шум в латентном пространстве
             z0 = torch.randn_like(z1)
@@ -735,6 +613,8 @@ def train_latent_flow_matching_dit(args):
         
         # Обновляем learning rate для DiT
         model_scheduler.step()
+        current_lr = model_optimizer.param_groups[0]['lr']
+        logger.add_scalar("Learning_Rate", current_lr, global_step=epoch)
         
         # Оценка модели и сохранение результатов каждые 10 эпох
         if epoch % 10 == 0:
@@ -754,9 +634,8 @@ def train_latent_flow_matching_dit(args):
             
             save_images(sampled_images, os.path.join("results", args.run_name, f"{epoch}.jpg"))
             
-            # Сохраняем модели
+            # Сохраняем только DiT модель (VAE предобучен)
             torch.save(model.state_dict(), os.path.join("models", args.run_name, f"dit_ckpt.pt"))
-            torch.save(autoencoder.state_dict(), os.path.join("models", args.run_name, f"vae_ckpt.pt"))
 
 
 def launch_latent_flow_matching_dit():
@@ -778,41 +657,35 @@ def launch_latent_flow_matching_dit():
     args.autoencoder_lr = 2e-4
     args.weight_decay = 0.01
     
-    # VAE настройки
-    args.latent_size = 32
-    args.latent_channels = 16  # Увеличено для лучшего качества
-    args.base_channels = 64
-    args.autoencoder_epochs = 150  # Больше эпох для лучшего обучения
-    args.beta = 0.1  # Уменьшено для лучшего качества реконструкции
-    args.perceptual_weight = 0.1  # Вес для perceptual loss
-    args.retrain_vae = False  # Если True, переобучает VAE даже если есть сохраненные веса
+    # SD VAE настройки (предобученный VAE)
+    args.latent_size = 8   # SD VAE использует 8x8 латентное пространство
+    args.latent_channels = 4  # SD VAE использует 4 канала
     args.retrain_dit = False  # Если True, переобучает DiT даже если есть сохраненные веса
     
-    # DiT настройки
-    args.patch_size = 4
-    args.embed_dim = 768  # Увеличено для лучшего качества
-    args.depth = 16       # Больше слоев
-    args.num_heads = 12   # Больше attention heads
+    # DiT настройки для SD VAE
+    args.patch_size = 2    # Уменьшенный patch size для меньшего латентного пространства
+    args.embed_dim = 512   # Оптимизировано для меньшего латентного пространства
+    args.depth = 12        # Оптимальное количество слоев
+    args.num_heads = 8     # Оптимальное количество attention heads
     args.mlp_ratio = 4.0
-    args.dropout = 0.05   # Уменьшено для лучшего обучения
+    args.dropout = 0.1
     
     train_latent_flow_matching_dit(args)
 
 
 def load_trained_models(run_name, device="cuda"):
     """Загружает обученные модели для генерации"""
-    # Создаем улучшенный VAE
-    autoencoder = ImprovedVAE(
-        in_channels=3,
-        latent_channels=16,
-        base_channels=64
-    ).to(device)
+    # Создаем Stable Diffusion VAE
+    autoencoder = StableDiffusionVAE(
+        model_id="stabilityai/sd-vae-ft-mse",
+        device=device
+    )
     
-    # Создаем DiT модель
+    # Создаем DiT модель для SD VAE
     model = LatentDiT(
-        latent_size=32,
-        latent_channels=16,  # Обновлено для соответствия новому VAE
-        patch_size=4,
+        latent_size=8,  # SD VAE использует 8x8
+        latent_channels=4,  # SD VAE использует 4 канала
+        patch_size=2,  # Уменьшенный patch size
         embed_dim=512,
         depth=12,
         num_heads=8,
@@ -821,21 +694,16 @@ def load_trained_models(run_name, device="cuda"):
         dropout=0.1
     ).to(device)
     
-    # Загружаем веса
-    vae_path = os.path.join("models", run_name, "vae_ckpt.pt")
+    # Загружаем веса только для DiT модели
     dit_path = os.path.join("models", run_name, "dit_ckpt.pt")
-    
-    if os.path.exists(vae_path):
-        autoencoder.load_state_dict(torch.load(vae_path, map_location=device))
-        print(f"VAE loaded from {vae_path}")
-    else:
-        raise FileNotFoundError(f"VAE checkpoint not found at {vae_path}")
     
     if os.path.exists(dit_path):
         model.load_state_dict(torch.load(dit_path, map_location=device))
         print(f"DiT model loaded from {dit_path}")
     else:
         raise FileNotFoundError(f"DiT checkpoint not found at {dit_path}")
+    
+    print("SD VAE loaded (pre-trained)")
     
     return model, autoencoder
 
@@ -844,11 +712,11 @@ def generate_samples(run_name="LatentFlowMatching_DiT", num_samples=10, device="
     """Генерирует образцы с помощью обученных моделей"""
     model, autoencoder = load_trained_models(run_name, device)
     
-    # Создаем Flow Matching объект
+    # Создаем Flow Matching объект для SD VAE
     flow_matching = LatentFlowMatchingDiT(
         img_size=64,
-        latent_size=32,
-        latent_channels=16,  # Обновлено для соответствия новому VAE
+        latent_size=8,  # SD VAE использует 8x8
+        latent_channels=4,  # SD VAE использует 4 канала
         device=device
     )
     

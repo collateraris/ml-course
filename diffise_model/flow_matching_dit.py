@@ -314,6 +314,9 @@ def train_flow_matching_dit(args):
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
+    # Создаем scheduler для learning rate
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+    
     # Создаем Flow Matching объект
     flow_matching = FlowMatchingDiT(img_size=args.image_size, device=device)
     
@@ -349,6 +352,11 @@ def train_flow_matching_dit(args):
             pbar.set_postfix(Loss=loss.item())
             logger.add_scalar("Loss", loss.item(), global_step=epoch * l + i)
         
+        # Обновляем learning rate после каждой эпохи
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        logger.add_scalar("Learning_Rate", current_lr, global_step=epoch)
+        
         # Сохраняем результаты каждые 10 эпох
         if args.conditional is True:
             labels = torch.arange(10).long().to(device)
@@ -375,7 +383,7 @@ def launch_flow_matching_dit():
     args.conditional = True
     args.num_classes = 10
     args.device = "cuda"
-    args.lr = 1e-2
+    args.lr = 1e-3
     args.weight_decay = 0.01
     
     # DiT настройки
