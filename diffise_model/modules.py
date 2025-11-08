@@ -30,10 +30,9 @@ class EMA:
         ema_model.load_state_dict(model.state_dict())
 
 class SelfAttention(nn.Module):
-    def __init__(self, channels, size):
+    def __init__(self, channels, size=None):
         super(SelfAttention, self).__init__()
         self.channels = channels
-        self.size = size
         self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
         self.ln = nn.LayerNorm([channels])
         self.ff_self = nn.Sequential(
@@ -44,12 +43,13 @@ class SelfAttention(nn.Module):
         )
 
     def forward(self, x):
-        x = x.view(-1, self.channels, self.size * self.size).swapaxes(1, 2)
+        b, _, h, w = x.shape
+        x = x.view(b, self.channels, h * w).swapaxes(1, 2)
         x_ln = self.ln(x)
         attention_value, _ = self.mha(x_ln, x_ln, x_ln)
         attention_value = attention_value + x
         attention_value = self.ff_self(attention_value) + attention_value
-        return attention_value.swapaxes(2, 1).view(-1, self.channels, self.size, self.size)
+        return attention_value.swapaxes(2, 1).view(b, self.channels, h, w)
 
 
 class DoubleConv(nn.Module):

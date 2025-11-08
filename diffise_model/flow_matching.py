@@ -12,6 +12,8 @@ from utils import *
 from modules import UNet, EMA
 import logging
 from torch.utils.tensorboard import SummaryWriter
+from diffusers import AutoencoderKL
+from sd_vae_finetune import train_stable_diffusion_vae
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s: %(message)s", level=logging.INFO, datefmt="%I:%M:%S")
 
@@ -130,7 +132,7 @@ class FlowMatching:
 
 class OptimalTransportFlowMatching:
     def __init__(self, img_size=256, device="cuda", sigma_min=1e-4, sigma_max=1.0, 
-                 ot_reg=0.1, ot_max_iter=100, ot_tolerance=1e-6):
+                 ot_reg=0.1, ot_max_iter=100, ot_tolerance=1e-6, channels=3):
         """
         Optimal Transport Flow Matching модель для генерации изображений.
         
@@ -150,6 +152,7 @@ class OptimalTransportFlowMatching:
         self.ot_reg = ot_reg
         self.ot_max_iter = ot_max_iter
         self.ot_tolerance = ot_tolerance
+        self.channels = channels
 
     def compute_cost_matrix(self, x0, x1):
         """
@@ -314,7 +317,7 @@ class OptimalTransportFlowMatching:
         
         with torch.no_grad():
             # Начинаем с шума
-            x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
+            x = torch.randn((n, self.channels, self.img_size, self.img_size)).to(self.device)
             
             # Численное интегрирование ODE
             dt = 1.0 / num_steps
@@ -334,9 +337,10 @@ class OptimalTransportFlowMatching:
                 x = x + dt * predicted_velocity
         
         model.train()
-        # Нормализуем изображения в диапазон [0, 1]
-        x = (x.clamp(-1, 1) + 1) / 2
-        x = (x * 255).type(torch.uint8)
+        if self.channels == 3:
+            # Нормализуем изображения в диапазон [0, 1]
+            x = (x.clamp(-1, 1) + 1) / 2
+            x = (x * 255).type(torch.uint8)
         return x
 
     def compute_loss(self, model, x0, x1, labels=None):
@@ -434,9 +438,31 @@ def train_optimal_transport_flow_matching(args):
     setup_logging(args.run_name)
     device = args.device
     dataloader = get_data(args)
+
+    if not hasattr(args, "vae_checkpoint"):
+        raise ValueError("Для обучения в латентном пространстве необходимо указать args.vae_checkpoint.")
+
+    logging.info(f"Loading fine-tuned Stable Diffusion VAE from {args.vae_checkpoint}...")
+    vae_ckpt = torch.load(args.vae_checkpoint, map_location=device)
+    pretrained_id = vae_ckpt["config"].get("pretrained_id", "stabilityai/sd-vae-ft-mse")
+    vae = AutoencoderKL.from_pretrained(pretrained_id, torch_dtype=torch.float32).to(device)
+    vae.load_state_dict(vae_ckpt["state_dict"])
+    scaling_factor = vae_ckpt["config"].get("scaling_factor", getattr(vae.config, "scaling_factor", 0.18215))
+    vae.config.scaling_factor = scaling_factor
+    vae.eval()
+    vae.requires_grad_(False)
+
+    downsample_factor = 2 ** (len(getattr(vae.config, "block_out_channels", [1, 1, 1, 1])) - 1)
+    if args.image_size % downsample_factor != 0:
+        raise ValueError(
+            f"Размер изображения {args.image_size} не делится на фактор понижения VAE {downsample_factor}."
+        )
+
+    latent_size = args.image_size // downsample_factor
+    latent_channels = getattr(vae.config, "latent_channels", 4)
     
     # Используем ту же архитектуру UNet, что и в DDPM
-    model = UNet(num_classes=args.num_classes).to(device)
+    model = UNet(c_in=latent_channels, c_out=latent_channels, num_classes=args.num_classes).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     
     # Создаем scheduler для learning rate
@@ -444,11 +470,12 @@ def train_optimal_transport_flow_matching(args):
     
     # Создаем Optimal Transport Flow Matching объект
     ot_flow_matching = OptimalTransportFlowMatching(
-        img_size=args.image_size, 
+        img_size=latent_size, 
         device=device,
         ot_reg=getattr(args, 'ot_reg', 0.1),
         ot_max_iter=getattr(args, 'ot_max_iter', 100),
-        ot_tolerance=getattr(args, 'ot_tolerance', 1e-6)
+        ot_tolerance=getattr(args, 'ot_tolerance', 1e-6),
+        channels=latent_channels,
     )
     
     # Настройка логирования
@@ -465,15 +492,19 @@ def train_optimal_transport_flow_matching(args):
             images = images.to(device)
             labels = labels.to(device)
             
-            # Создаем шум для начальных точек
-            noise = torch.randn_like(images)
+            with torch.no_grad():
+                posterior = vae.encode(images)
+                latents = posterior.latent_dist.sample() * scaling_factor
+
+            # Создаем шум для начальных точек в латентном пространстве
+            noise = torch.randn_like(latents)
             
             # Иногда используем unconditional обучение для classifier-free guidance
             if args.conditional is False or np.random.random() < 0.1:
                 labels = None
             
             # Вычисляем loss с оптимальным транспортом
-            loss = ot_flow_matching.compute_loss(model, noise, images, labels)
+            loss = ot_flow_matching.compute_loss(model, noise, latents.detach(), labels)
 
             optimizer.zero_grad()
             loss.backward()
@@ -492,9 +523,14 @@ def train_optimal_transport_flow_matching(args):
         if epoch % 10 == 0:
             if args.conditional is True:
                 labels = torch.arange(args.num_classes).long().to(device)
-                sampled_images = ot_flow_matching.sample(ema_model, n=len(labels), labels=labels, cfg_scale=3)
+                sampled_latents = ot_flow_matching.sample(ema_model, n=len(labels), labels=labels, cfg_scale=3)
             else:
-                sampled_images = ot_flow_matching.sample(model, n=images.shape[0], labels=None, cfg_scale=0)
+                sampled_latents = ot_flow_matching.sample(model, n=images.shape[0], labels=None, cfg_scale=0)
+
+            with torch.no_grad():
+                decoded = vae.decode(sampled_latents / scaling_factor).sample
+                decoded = (decoded.clamp(-1, 1) + 1) / 2
+                sampled_images = (decoded * 255).type(torch.uint8)
             
             save_images(sampled_images, os.path.join("results", args.run_name, f"{epoch}.jpg"))
             torch.save(model.state_dict(), os.path.join("models", args.run_name, f"ckpt.pt"))
@@ -520,6 +556,27 @@ def launch_flow_matching():
     train_flow_matching(args)
 
 
+def launch_sd_vae_finetune():
+    """Функция запуска дообучения Stable Diffusion VAE"""
+    import argparse
+    parser = argparse.ArgumentParser()
+    args = parser.parse_args()
+
+    args.run_name = "SDVAE_Finetune"
+    args.epochs = 200
+    args.batch_size = 10
+    args.image_size = 64
+    args.dataset_path = r"E:\data_diffuse\datasets\cifar10-64-single1\train"
+    args.device = "cuda"
+    args.lr = 1e-4
+    args.weight_decay = 0.0
+    args.kl_weight = 1e-6
+    args.pretrained_vae = "stabilityai/sd-vae-ft-mse"
+    args.save_interval = 20
+
+    train_stable_diffusion_vae(args)
+
+
 def launch_optimal_transport_flow_matching():
     """Функция запуска обучения Optimal Transport Flow Matching"""
     import argparse
@@ -527,20 +584,21 @@ def launch_optimal_transport_flow_matching():
     args = parser.parse_args()
     
     # Настройки для условной генерации
-    args.run_name = "OptimalTransportFlowMatching_Conditional"
-    args.epochs = 3000
-    args.batch_size = 20
+    args.run_name = "OptimalTransportFlowMatching_SDLatent"
+    args.epochs = 5000
+    args.batch_size = 1
     args.image_size = 64
     args.dataset_path = r"E:\data_diffuse\datasets\cifar10-64-single1\train"
     args.conditional = False
     args.num_classes = 1
     args.device = "cuda"
-    args.lr = 1e-5
+    args.lr = 1e-4
     
     # Параметры оптимального транспорта
     args.ot_reg = 0.1  # Параметр регуляризации Sinkhorn
     args.ot_max_iter = 100  # Максимальное количество итераций Sinkhorn
     args.ot_tolerance = 1e-6  # Допустимая ошибка для сходимости
+    args.vae_checkpoint = r"models\SDVAE_Finetune\sd_vae_epoch_200.pt"
     
     train_optimal_transport_flow_matching(args)
 
@@ -551,3 +609,5 @@ if __name__ == '__main__':
     
     # Запуск Optimal Transport Flow Matching
     launch_optimal_transport_flow_matching()
+    # Запуск fine-tuning VAE
+   # launch_sd_vae_finetune()
