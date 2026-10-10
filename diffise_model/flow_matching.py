@@ -564,9 +564,9 @@ def launch_sd_vae_finetune():
 
     args.run_name = "SDVAE_Finetune"
     args.epochs = 200
-    args.batch_size = 10
+    args.batch_size = 100
     args.image_size = 64
-    args.dataset_path = r"E:\data_diffuse\datasets\cifar10-64-single1\train"
+    args.dataset_path = r"E:\data_diffuse\datasets\faces_dataset_small\huge_256"
     args.device = "cuda"
     args.lr = 1e-4
     args.weight_decay = 0.0
@@ -586,9 +586,9 @@ def launch_optimal_transport_flow_matching():
     # Настройки для условной генерации
     args.run_name = "OptimalTransportFlowMatching_SDLatent"
     args.epochs = 5000
-    args.batch_size = 1
-    args.image_size = 64
-    args.dataset_path = r"E:\data_diffuse\datasets\cifar10-64-single1\train"
+    args.batch_size = 50
+    args.image_size = 256
+    args.dataset_path = r"E:\data_diffuse\datasets\faces_dataset_small\huge_256"
     args.conditional = False
     args.num_classes = 1
     args.device = "cuda"
@@ -598,7 +598,7 @@ def launch_optimal_transport_flow_matching():
     args.ot_reg = 0.1  # Параметр регуляризации Sinkhorn
     args.ot_max_iter = 100  # Максимальное количество итераций Sinkhorn
     args.ot_tolerance = 1e-6  # Допустимая ошибка для сходимости
-    args.vae_checkpoint = r"models\SDVAE_Finetune\sd_vae_epoch_200.pt"
+    args.vae_checkpoint = r"models\SDVAE_Finetune\sd_vae_epoch_0.pt"
     
     train_optimal_transport_flow_matching(args)
 
@@ -610,4 +610,4 @@ if __name__ == '__main__':
     # Запуск Optimal Transport Flow Matching
     launch_optimal_transport_flow_matching()
     # Запуск fine-tuning VAE
-   # launch_sd_vae_finetune()
+    #launch_sd_vae_finetune()
